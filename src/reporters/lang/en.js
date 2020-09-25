@@ -45,7 +45,8 @@ const messages = {
     '$0 has dependency $1 with range $2 that collides with a dependency in $3 of the same name with version $4',
   manifestDirectoryNotFound: 'Unable to read $0 directory of module $1',
 
-  verboseFileCopy: 'Copying $0 to $1.',
+  verboseWorkerCompleted: 'Worker $0 / $1 completed.',
+  verboseFileCopy: 'Copying $0 to $1. ($2)',
   verboseFileLink: 'Creating hardlink at $0 to $1.',
   verboseFileSymlink: 'Creating symlink at $0 to $1.',
   verboseFileSkip: 'Skipping copying of file $0 as the file at $1 is the same size ($2) and mtime ($3).',
@@ -358,6 +359,7 @@ const messages = {
   errorExtractingTarball: 'Extracting tar content of $1 failed, the file appears to be corrupt: $0',
   updateInstalling: 'Installing $0...',
   hostedGitResolveError: 'Error connecting to repository. Please, check the url.',
+  unauthorizedResponse: 'Received a 401 from $0. $1',
 
   unknownFetcherFor: 'Unknown fetcher for $0',
 

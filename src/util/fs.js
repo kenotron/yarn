@@ -8,6 +8,7 @@ import fs from 'fs';
 import globModule from 'glob';
 import os from 'os';
 import path from 'path';
+import mkdirp from 'mkdirp';
 
 import BlockingQueue from './blocking-queue.js';
 import * as promise from './promise.js';
@@ -37,13 +38,12 @@ export const readdir: (path: string, opts: void) => Promise<Array<string>> = pro
 export const rename: (oldPath: string, newPath: string) => Promise<void> = promisify(fs.rename);
 export const access: (path: string, mode?: number) => Promise<void> = promisify(fs.access);
 export const stat: (path: string) => Promise<fs.Stats> = promisify(fs.stat);
-export const mkdirp: (path: string) => Promise<void> = promisify(require('mkdirp'));
 export const exists: (path: string) => Promise<boolean> = promisify(fs.exists, true);
 export const lstat: (path: string) => Promise<fs.Stats> = promisify(fs.lstat);
 export const chmod: (path: string, mode: number | string) => Promise<void> = promisify(fs.chmod);
 export const link: (src: string, dst: string) => Promise<fs.Stats> = promisify(fs.link);
 export const glob: (path: string, options?: Object) => Promise<Array<string>> = promisify(globModule);
-export {unlink};
+export {unlink, mkdirp};
 
 // fs.copyFile uses the native file copying instructions on the system, performing much better
 // than any JS-based solution and consumes fewer resources. Repeated testing to fine tune the
@@ -513,6 +513,23 @@ export function copy(src: string, dest: string, reporter: Reporter): Promise<voi
   return copyBulk([{src, dest}], reporter);
 }
 
+const { Worker } = require('worker_threads');
+function spawnWorker() {
+    return new Worker(require('path').join(__dirname, '..', 'worker.js'));
+}
+
+const numberOfWorkers = Math.ceil(os.cpus().length/ 2)
+
+export function createWorkers() {
+  const workers = [];
+
+  for (let i = 0; i < numberOfWorkers; i++) {
+    const worker = spawnWorker();
+    workers.push(worker);
+  }
+  return workers;
+}
+
 export async function copyBulk(
   queue: CopyQueue,
   reporter: Reporter,
@@ -531,30 +548,63 @@ export async function copyBulk(
     ignoreBasenames: (_events && _events.ignoreBasenames) || [],
     artifactFiles: (_events && _events.artifactFiles) || [],
   };
-
   const actions: CopyActions = await buildActionsForCopy(queue, events, events.possibleExtraneous, reporter);
   events.onStart(actions.file.length + actions.symlink.length + actions.link.length);
 
   const fileActions: Array<CopyFileAction> = actions.file;
 
-  const currentlyWriting: Map<string, Promise<void>> = new Map();
+  const workers = createWorkers();
+  await new Promise((resolve, reject) => {
+    const split = fileActions
+      .reduce(
+        (acc, curr) => {
+          if (acc[acc.length - 1].length < Math.ceil(fileActions.length / numberOfWorkers)) {
+            acc[acc.length - 1].push(curr);
+          } else {
+            acc.push([curr]);
+          }
+          return acc;
+        },
+        [[]],
+      )
+      .filter(ac => ac && ac.length);
 
-  await promise.queue(
-    fileActions,
-    async (data: CopyFileAction): Promise<void> => {
-      let writePromise;
-      while ((writePromise = currentlyWriting.get(data.dest))) {
-        await writePromise;
-      }
+    if (!split.length) {
+      resolve();
+    }
 
-      reporter.verbose(reporter.lang('verboseFileCopy', data.src, data.dest));
-      const copier = copyFile(data, () => currentlyWriting.delete(data.dest));
-      currentlyWriting.set(data.dest, copier);
-      events.onProgress(data.dest);
-      return copier;
-    },
-    CONCURRENT_QUEUE_ITEMS,
-  );
+    let running = split.length;
+    split.forEach((ac, i) => {
+      const worker = workers[i];
+      const onError = err => {
+        worker.off('error', onError);
+        worker.off('close', onError);
+        worker.off('message', onMessage);
+        reject(err && err.err);
+      };
+      const onMessage = () => {
+        reporter.verbose(reporter.lang('verboseWorkerCompleted', i, split.length));
+        worker.off('error', onError);
+        worker.off('close', onError);
+        worker.off('message', onMessage);
+        ac.forEach(a => events.onProgress(a.dest));
+        running -= 1;
+        if (running === 0) {
+          resolve();
+        }
+      };
+      worker.on('error', onError);
+      worker.on('close', onError);
+      worker.on('message', onMessage);
+      const actions = ac.map(action => ({src: action.src, dest: action.dest}));
+      actions.forEach(action =>
+        reporter.verbose(
+          reporter.lang('verboseFileCopy', action.src, action.dest, `worker ${i}, total ${actions.length}`),
+        ),
+      );
+      worker.postMessage({actions});
+    });
+  }).finally(() => workers.forEach(w => w.terminate()));
 
   // we need to copy symlinks last as they could reference files we were copying
   const symlinkActions: Array<CopySymlinkAction> = actions.symlink;

@@ -16,6 +16,20 @@ import map from '../util/map.js';
 
 import typeof * as RequestModuleT from 'request';
 
+import { Transform } from "stream";
+
+/*
+ * PassThrough stream in the pipelines to add
+ * A large buffer that can handle a large amount of backpressure that arises
+ * when the cpu cannot keep up with the inflow from the network.
+ */
+class BufferStream extends Transform {
+  constructor() {
+    super({transform: (chunk, encoding, callback) => { callback(null, chunk) }, highWaterMark: 16384 * 100000})
+
+  }
+}
+
 // Initialize DNS cache so we don't look up the same
 // domains like registry.yarnpkg.com over and over again
 // for each request.
@@ -199,6 +213,139 @@ export default class RequestManager {
     }
   }
 
+  /*
+   * This is a fake implementation of the request which is meant to behave just like
+   * request from the consumer perspective. The difference is that this fake implements
+   * some racing logic; when a request is still pending after a given amount of time, a
+   * second identical request will be fired and the two requests will race.
+   * This is a workaround for issues with the npm feed being very slow on random requests.
+   */
+  requestWithRacingRetry() {
+    const request = require('request');
+
+    const decoratedRequest = params => {
+      // Use a buffer stream to make sure the data does not overflow the various streams.
+      const bufferStream = new BufferStream();
+
+      // Variables keeping the state of the race.
+      let req2 = undefined;
+      let streams = [];
+      const callbacks = {};
+      let done = false;
+      let aborted = false;
+
+      let req1 = request(params);
+      // We pause the stream so no response data flows out until we call .resume().
+      req1.pause();
+
+      // We arm the timeout for the racing request.
+      setTimeout(() => {
+        // The first request is already finished.
+        if (done) {
+          return;
+        }
+        req2 = request(params);
+        // We pause the stream so no response data flows out until we call .resume().
+        req2.pause();
+        req2.on('error', (...args) => {
+          // If request 1 has succeeded
+          if (done) {
+            return;
+          }
+
+          // If request 1 has failed
+          if (!req1) {
+            callbacks['error'] && callbacks['error'](...args);
+
+            done = true;
+          }
+          req2 = undefined;
+        });
+
+        req2.on('response', (...args) => {
+          // If request 1 has succeeded
+          if (done) {
+            return;
+          }
+
+          done = true;
+          callbacks['response'] && callbacks['response'](...args);
+
+          // If the callback has not aborted the request
+          if(!aborted) {
+            // We pipe the streams, and resume to let the data flow
+            req2.pipe(bufferStream);
+            streams.forEach(s => bufferStream.pipe(s));
+            req2.resume();
+          }
+          req1 && req1.abort();
+          req1 = undefined;
+          req1 = undefined;
+        });
+      }, constants.RACING_REQUEST_DELAY);
+
+      req1.on('error', (...args) => {
+        // If request 2 has succeeded
+        if (done) {
+          return;
+        }
+
+        // If request 2 has failed or is not started
+        if (!req2) {
+          callbacks['error'] && callbacks['error'](...args);
+
+          done = true;
+        }
+
+        req1 = undefined;
+      });
+
+      req1.on('response', (...args) => {
+        // If request 2 has succeeded
+        if (done) {
+          return;
+        }
+
+        done = true;
+
+        callbacks['response'] && callbacks['response'](...args);
+
+        // If the callback has not aborted the request
+        if(!aborted) {
+          // We pipe the streams, and resume to let the data flow
+          req1.pipe(bufferStream);
+          streams.forEach(s => bufferStream.pipe(s));
+          req1.resume();
+        }
+        req2 && req2.abort();
+        req2 = undefined;
+        req1 = undefined;
+
+      });
+
+      // We return a fake request which implements the API that yarn uses
+      return {
+        on: (event, callback) => {
+          callbacks[event] = callback;
+        },
+
+        abort: () => {
+          aborted = true;
+          req1.abort();
+          req2 && req2.abort();
+          done = true;
+        },
+
+        pipe: s => {
+          streams.push(s);
+          return s;
+        },
+      };
+    };
+
+    return decoratedRequest;
+  }
+
   /**
    * Lazy load `request` since it is exceptionally expensive to load and is
    * often not needed at all.
@@ -206,7 +353,7 @@ export default class RequestManager {
 
   _getRequestModule(): RequestModuleT {
     if (!this._requestModule) {
-      const request = require('request');
+      const request = this.requestWithRacingRetry();
       if (this.captureHar) {
         this._requestCaptureHar = new RequestCaptureHar(request);
         this._requestModule = this._requestCaptureHar.request.bind(this._requestCaptureHar);
@@ -243,7 +390,35 @@ export default class RequestManager {
     );
 
     const promise = new Promise((resolve, reject) => {
-      this.queue.push({params, reject, resolve});
+
+      /*
+       * This is a workaround for a bug that we have not been able to track down.
+       *
+       * Sometimes yarn would quit in the middle of fetching the packages
+       * with an exit code of 0. This typically happens when node has no more external resources or timeouts
+       * to wait for. This is an issue because yarn reports a success but the dependencies are
+       * not installed.
+       *
+       * A timeout prevents node from successfully exiting when this bug hits.
+       * When a promise takes more than 10min to resolve, we are likely hitting this bug, we then hard fail
+       * to properly report the failure.
+       */
+      const t = setTimeout(() => {
+        throw new Error(`Fetching/extracting of package ${params.url} seems to be hanging.`);
+
+      }, 10 * 60 * 1000);
+
+
+      const rej = (...args) => {
+        reject(...args);
+        clearTimeout(t);
+      }
+      const res = (...args) => {
+        resolve(...args);
+        clearTimeout(t);
+      }
+
+      this.queue.push({params, reject: rej, resolve: res});
       this.shiftQueue();
     });
 
@@ -373,6 +548,11 @@ export default class RequestManager {
       rejectNext(err);
     };
 
+    const rejectWithoutUrl = function(err) {
+      err.message = err.message;
+      rejectNext(err);
+    };
+
     const queueForRetry = reason => {
       const attempts = params.retryAttempts || 0;
       if (attempts >= this.maxRetryAttempts - 1) {
@@ -426,6 +606,11 @@ export default class RequestManager {
           } else {
             return;
           }
+        }
+
+        if (res.statusCode === 401 && res.caseless && res.caseless.get('server') === 'GitHub.com') {
+          const message = `${res.body.message}. If using GITHUB_TOKEN in your env, check that it is valid.`;
+          rejectWithoutUrl(new Error(this.reporter.lang('unauthorizedResponse', res.caseless.get('server'), message)));
         }
 
         if (res.statusCode === 401 && res.headers['www-authenticate']) {
@@ -495,11 +680,6 @@ export default class RequestManager {
 
     req.on('error', onError);
 
-    const queue = params.queue;
-    if (queue) {
-      req.on('data', queue.stillActive.bind(queue));
-    }
-
     const process = params.process;
     if (process) {
       req.on('response', res => {
@@ -508,11 +688,17 @@ export default class RequestManager {
         }
 
         const description = `${res.statusCode} ${http.STATUS_CODES[res.statusCode]}`;
-        reject(new ResponseError(this.reporter.lang('requestFailed', description), res.statusCode));
+        queueForRetry(`request failed with ${res.statusCode}`) || reject(new ResponseError(this.reporter.lang('requestFailed', description), res.statusCode));
 
         req.abort();
       });
-      process(req, resolve, reject);
+
+      // We retry when we fail to process the content
+      const rej = (err) => {
+        queueForRetry("extraction failed, package content seems to be corrupt") || reject(err);
+      }
+
+      process(req, resolve, rej);
     }
   }
 

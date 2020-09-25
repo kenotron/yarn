@@ -136,6 +136,11 @@ export default class TarballFetcher extends BaseFetcher {
       chown: false, // don't chown. just leave as it is
       map: header => {
         header.mtime = now;
+        if (header.linkname) {
+          const basePath = path.posix.dirname(path.join('/', header.name));
+          const jailPath = path.posix.join(basePath, header.linkname);
+          header.linkname = path.posix.relative('/', jailPath);
+        }
         return header;
       },
       fs: patchedFs,
@@ -262,6 +267,7 @@ export default class TarballFetcher extends BaseFetcher {
             const {hashValidateStream, integrityValidateStream, extractorStream} = this.createExtractor(
               resolve,
               reject,
+              tarballCachePath,
             );
 
             req.pipe(hashValidateStream);

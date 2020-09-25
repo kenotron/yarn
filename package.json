@@ -1,7 +1,7 @@
 {
-  "name": "yarn",
+  "name": "midgard-yarn",
   "installationMethod": "unknown",
-  "version": "1.22.0-0",
+  "version": "1.23.18",
   "license": "BSD-2-Clause",
   "preferGlobal": true,
   "description": "📦🐈 Fast, reliable, and secure dependency management.",
@@ -32,7 +32,7 @@
     "leven": "^2.0.0",
     "loud-rejection": "^1.2.0",
     "micromatch": "^2.3.11",
-    "mkdirp": "^0.5.1",
+    "mkdirp": "^1.0.0",
     "node-emoji": "^1.6.1",
     "normalize-url": "^2.0.0",
     "npm-logical-tree": "^1.2.1",
@@ -107,10 +107,10 @@
   "engines": {
     "node": ">=4.0.0"
   },
-  "repository": "yarnpkg/yarn",
+  "repository": "VincentBailly/yarn",
   "bin": {
-    "yarn": "./bin/yarn.js",
-    "yarnpkg": "./bin/yarn.js"
+    "midgard-yarn": "./bin/yarn.js",
+    "midgard-yarnpkg": "./bin/yarn.js"
   },
   "scripts": {
     "build": "gulp build",

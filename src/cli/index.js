@@ -187,7 +187,11 @@ export async function main({
     commandName = 'install';
     isKnownCommand = true;
   }
-
+  if (commandName === ('set': string) && args[0] === 'version') {
+    commandName = ('policies': string);
+    args.splice(0, 1, 'set-version');
+    isKnownCommand = true;
+  }
   if (!isKnownCommand) {
     // if command is not recognized, then set default to `run`
     args.unshift(commandName);
@@ -297,7 +301,7 @@ export async function main({
 
     return command.run(config, reporter, commander, commander.args).then(exitCode => {
       if (shouldWrapOutput) {
-        reporter.footer(false);
+        reporter.footer(true);
       }
       return exitCode;
     });
